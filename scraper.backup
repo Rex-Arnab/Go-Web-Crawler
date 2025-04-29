@@ -1,0 +1,227 @@
+package main
+
+import (
+	"fmt"
+	"io"
+	"log"
+	"net/http"
+	"net/url"
+	"os"
+	"strings"
+	"sync"
+
+	"golang.org/x/net/html"
+)
+
+// Visited URLs tracker
+type SafeVisited struct {
+	mu      sync.Mutex
+	visited map[string]bool
+}
+
+// Add marks a URL as visited. Returns true if it was added, false if already visited.
+func (v *SafeVisited) Add(url string) bool {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	if v.visited[url] {
+		return false // Already visited
+	}
+	v.visited[url] = true
+	return true
+}
+
+// GetVisited returns a copy of the visited URLs.
+func (v *SafeVisited) GetVisited() []string {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	urls := make([]string, 0, len(v.visited))
+	for k := range v.visited {
+		urls = append(urls, k)
+	}
+	return urls
+}
+
+// --- Main Scraping Logic ---
+
+func main() {
+	if len(os.Args) != 2 {
+		fmt.Fprintf(os.Stderr, "Usage: %s <start_url>\n", os.Args[0])
+		os.Exit(1)
+	}
+	startURL := os.Args[1]
+
+	// Validate and parse the starting URL
+	baseURL, err := url.Parse(startURL)
+	if err != nil || (baseURL.Scheme != "http" && baseURL.Scheme != "https") {
+		log.Fatalf("Invalid starting URL: %v", err)
+	}
+	// Ensure base URL doesn't have path/query/fragment for domain checking
+	baseDomainURL := &url.URL{
+		Scheme: baseURL.Scheme,
+		Host:   baseURL.Host,
+	}
+
+	fmt.Printf("Starting crawl from: %s\n", baseURL.String())
+	fmt.Printf("Target Domain: %s\n", baseDomainURL.Host)
+
+	// Use channels and WaitGroup for concurrency
+	queue := make(chan string, 100) // Buffered channel for URLs to visit
+	var wg sync.WaitGroup
+	visited := SafeVisited{visited: make(map[string]bool)}
+
+	// Start with the initial URL
+	queue <- baseURL.String()
+	visited.Add(baseURL.String()) // Mark initial URL as visited
+	wg.Add(1)                     // Add 1 task to the WaitGroup
+
+	// Start worker goroutines (adjust number based on needs/resources)
+	numWorkers := 10
+	for i := 0; i < numWorkers; i++ {
+		go worker(queue, &wg, &visited, baseDomainURL)
+	}
+
+	// Wait for all crawling tasks to complete
+	wg.Wait()
+	close(queue) // Close queue once initial work and its descendants are done
+
+	// Print results
+	fmt.Println("\n--- Found Internal URLs ---")
+	foundURLs := visited.GetVisited()
+	for _, u := range foundURLs {
+		fmt.Println(u)
+	}
+	fmt.Printf("\nTotal internal URLs found: %d\n", len(foundURLs))
+}
+
+// worker processes URLs from the queue
+func worker(queue chan string, wg *sync.WaitGroup, visited *SafeVisited, baseDomainURL *url.URL) {
+	for urlStr := range queue {
+		crawlPage(urlStr, queue, wg, visited, baseDomainURL)
+		wg.Done() // Signal that this task is finished
+	}
+}
+
+// crawlPage fetches and parses a single page
+func crawlPage(urlStr string, queue chan string, wg *sync.WaitGroup, visited *SafeVisited, baseDomainURL *url.URL) {
+	fmt.Println("Crawling:", urlStr)
+
+	// Create custom client/request to set User-Agent
+	client := &http.Client{}
+	req, err := http.NewRequest("GET", urlStr, nil)
+	if err != nil {
+		log.Printf("Error creating request for %s: %v", urlStr, err)
+		return
+	}
+	// Set a simple User-Agent
+	req.Header.Set("User-Agent", "GoInternalLinkScraper/1.0")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		log.Printf("Error fetching %s: %v", urlStr, err)
+		return
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		log.Printf("Error fetching %s: Status code %d", urlStr, resp.StatusCode)
+		return
+	}
+
+	// Important: Use the final URL after redirects as the base for resolving relative links
+	currentPageURL := resp.Request.URL
+
+	// Check content type - we only want HTML
+	contentType := resp.Header.Get("Content-Type")
+	if !strings.Contains(contentType, "text/html") {
+		// log.Printf("Skipping non-HTML content at %s (Content-Type: %s)", urlStr, contentType)
+		return
+	}
+
+	// Parse HTML
+	links := findLinks(resp.Body, currentPageURL)
+
+	// Process found links
+	for _, link := range links {
+		// Resolve link relative to the current page's URL
+		absoluteURL := resolveURL(currentPageURL, link)
+		if absoluteURL == nil {
+			continue // Skip invalid URLs
+		}
+
+		// Normalize URL (remove fragment)
+		absoluteURL.Fragment = ""
+		normalizedURLStr := absoluteURL.String()
+
+		// Check if it's internal and not visited
+		if isInternal(absoluteURL, baseDomainURL) {
+			if visited.Add(normalizedURLStr) {
+				// If successfully added (wasn't visited before), add to queue
+				wg.Add(1)           // Increment WaitGroup counter *before* sending to queue
+				go func(u string) { // Launch sender in goroutine to avoid deadlock if queue is full
+					queue <- u
+				}(normalizedURLStr)
+			}
+		}
+	}
+}
+
+// findLinks extracts all href links from an HTML document
+func findLinks(body io.Reader, pageURL *url.URL) []string {
+	var links []string
+	tokenizer := html.NewTokenizer(body)
+
+	for {
+		tokenType := tokenizer.Next()
+		switch tokenType {
+		case html.ErrorToken:
+			// End of document or error
+			err := tokenizer.Err()
+			if err != io.EOF {
+				// Log parsing errors, but don't stop the crawl for minor issues
+				log.Printf("HTML parsing error on page %s: %v", pageURL.String(), err)
+			}
+			return links
+		case html.StartTagToken, html.SelfClosingTagToken:
+			token := tokenizer.Token()
+			if token.Data == "a" { // It's an anchor tag
+				for _, attr := range token.Attr {
+					if attr.Key == "href" {
+						links = append(links, attr.Val)
+						break // Found href, move to next token
+					}
+				}
+			}
+		}
+	}
+}
+
+// resolveURL makes a relative URL absolute, given the base URL of the page it was found on
+func resolveURL(base *url.URL, relative string) *url.URL {
+	// Trim leading/trailing whitespace which can invalidate URLs
+	relative = strings.TrimSpace(relative)
+	if relative == "" {
+		return nil
+	}
+
+	// Parse the relative URL
+	relURL, err := url.Parse(relative)
+	if err != nil {
+		// log.Printf("Error parsing relative link '%s' on page %s: %v", relative, base.String(), err)
+		return nil // Ignore invalid links
+	}
+
+	// Resolve the relative URL against the base URL
+	absoluteURL := base.ResolveReference(relURL)
+
+	// Only allow http and https schemes
+	if absoluteURL.Scheme != "http" && absoluteURL.Scheme != "https" {
+		return nil
+	}
+
+	return absoluteURL
+}
+
+// isInternal checks if a given URL belongs to the same host as the base domain URL
+func isInternal(linkURL *url.URL, baseDomainURL *url.URL) bool {
+	return linkURL.Host == baseDomainURL.Host
+}
