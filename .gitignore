@@ -1,2 +1,6 @@
 .vscode/settings.json
 downloaded_pages/**
+scraper.go
+crawl_state.json
+crawl_state_old.json
+crawler.log
