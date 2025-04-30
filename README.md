@@ -2,7 +2,7 @@
 
 A concurrent web crawler written in Go with terminal UI, state persistence, and intelligent resource handling.
 
-<video src='https://rex-arnab.github.io/Go-Web-Crawler/demo.webm' width=380 controls/>
+[![Watch the demo]](https://rex-arnab.github.io/Go-Web-Crawler/demo.webm)
 
 ## Features
 
